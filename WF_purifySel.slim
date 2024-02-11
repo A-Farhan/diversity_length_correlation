@@ -1,0 +1,190 @@
+function (void)saveSiteFreq(string$ path, integer$ ssize)
+{
+	// sample individuals
+	sampledIndividuals = sample( p1.individuals, ssize);
+	// extract their mutation-carrying chromosome
+	sampledGenomes = sampledIndividuals.genome1;
+	// get mutations within this sample
+	muts = unique( sampledGenomes.mutations);
+	// get sample frequency of these mutations
+	freqs = sampledGenomes.mutationFrequenciesInGenomes(muts);
+	// matrix of mutations positions and sample frequencies
+	out = cbind( asFloat( muts.position), freqs);
+	// exclude mutations that are present at 100 % frequency in the sample
+	out = out[ c( out[,1] < 1), ];
+	
+	// output as a string to be saved
+	strout=""; for(i in 0:(nrow(out)-1)) { strout = strout + paste(out[i,],sep=",") + "\n";}
+	// save output to file
+	writeFile(path,strout);
+}
+
+
+function (void)geneConversion(o<Individual>$ targetIndividual, integer$ meanTractLength)
+{
+	// Choose a source individual at random, excluding the target
+	sourceIndividual = p1.sampleIndividuals(1, exclude=targetIndividual);
+
+	sourceGenome = sourceIndividual.genome1;
+	targetGenome = targetIndividual.genome1;
+
+	// Choose a tract length and a position for the gene conversion event
+	position = rdunif(1, 0, sim.chromosome.lastPosition);
+	tractLength = rgeom(1, 1.0 / meanTractLength);
+	p_end = (position + tractLength - 1) % sim.chromosome.lastPosition;
+
+	source_muts = sourceGenome.mutations;
+	source_positions = source_muts.position;
+	target_muts = targetGenome.mutations;
+	target_positions = target_muts.position;
+
+	// Get the mutations from the sourceGenome and targetGenome that are within the GC tract
+	// If p_end < position, it means that we're over the edge of the chr
+	if (p_end < position)
+	{
+		mutToCopy = source_muts[source_positions <= p_end | source_positions >= position];
+		mutToRemove = target_muts[target_positions <= p_end | target_positions >= position];
+	}
+	// Else it's normal
+	else
+	{
+		mutToCopy = source_muts[ source_positions >= position & source_positions <= p_end];
+		mutToRemove = target_muts[ target_positions >= position & target_positions <= p_end];
+	}
+
+	// Remove the mutations from targetGenome that are within the tract
+	targetGenome.removeMutations(mutToRemove);
+
+	// Add the mutations found in sourceGenome
+	targetGenome.addMutations(mutToCopy);
+
+	return;
+}
+
+initialize()
+{
+	// constant sample size	
+	defineConstant("sampleSize", 50); // sample Size
+	// read chromosome map
+    chrmap = readCSV(fchr,colNames=F,colTypes="iiii").asMatrix(); 	
+    // number of genes	
+	ngenes = nrow(chrmap);
+	// the last base position in the chromosome map determined genome size	
+	defineConstant("genomeSize",c( chrmap[ngenes-1,3]));	
+	// HGT probability
+	defineConstant("GCrate", Rho * genomeSize); 
+	// log output intervals
+	defineConstant( "logtime", asInteger(0.5*Ne));	
+	
+	initializeMutationType("m1", 1.0, "f", 0.0); // cds, m1 mutation type must be Neutral in this simulation scheme
+	initializeMutationType("m2", 1.0, "f", dsel); // deleterious mutations
+	
+	// lengths of regions under negative selection
+	sellens = asInteger( rnorm( ngenes, sellen, sellen/10));
+	
+	// define genomic element types
+	initializeGenomicElementType("g1", m1, 1.0); // neutral cds
+	initializeGenomicElementType("g2", m2, 1.0); // initial part of cds under negative selection
+	
+    // create genome elements
+	for (i in 0:(ngenes-1)) {
+        // starting and ending position of constrained part
+        selStart = chrmap[i,2];
+        selEnd = chrmap[i,2] + sellens[i] - 1;
+
+        // check if gene is only large enough to contain the constrained part
+        if( selEnd >= chrmap[i,3]){                                             
+            selEnd = chrmap[i,3];                                               
+            initializeGenomicElement( g2, selStart, selEnd);                    
+        }                                                                       
+        else {                                                                  
+            nextPos = selEnd+1;                                                 
+            geneEnd = chrmap[i,3];                                              
+            initializeGenomicElement( g2, selStart, selEnd);                    
+            initializeGenomicElement( g1, nextPos, geneEnd);                    
+        }                                                                       
+    }                                                                           
+                                                                                
+	initializeMutationRate(Mu);
+	initializeRecombinationRate(0); // In SLiM recombination is between sister chromatids
+}
+
+// At the first generation:
+// - create a subpopulation (or many)
+1 late()
+{
+	sim.setValue("GC", 0); // logging purpose
+	sim.setValue("nindiv", 0);
+	sim.addSubpop("p1", asInteger(Ne));
+	p1.setCloningRate(1.0); // Essential for bacteria.
+	c1 = clock();
+	sim.setValue("time_beg", clock());
+	
+    community.rescheduleScriptBlock(s1, start=N_generations, end=N_generations);
+}
+
+
+// Remove mutation on the 2nd chromosome
+// at each generation so we don't keep in memory useless mutations
+modifyChild()
+{
+	child.genome2.removeMutations();
+	return T;
+}
+
+// At each generation:
+// - Remove fixed mutations
+// - Perform gene conversion events
+late()
+{
+	// Remove fixed mutation
+	// (SLiM does it automatically for diploid,
+	// but for haploid, mutations are fixed at 0.5)
+	muts = sim.mutations;
+	freqs = sim.mutationFrequencies(NULL, muts);
+	fixed_muts = muts[freqs >= 0.5];
+	if (size(fixed_muts) > 0)
+		sim.subpopulations.genomes.removeMutations(fixed_muts, T);
+
+	// Gene Conversion event
+	// each individual has a proba of gene conversion per bp
+	if (GCrate > 0)
+	{
+		nindiv = rbinom(1, Ne, GCrate);
+		sim.setValue("nindiv", sim.getValue("nindiv")+nindiv); // logging purpose
+
+		// choose targets for gene conversion; each individual can only be a target
+		// once per generation, to more closely mirror the nonWF model's logic
+		GCtargets = p1.sampleIndividuals(nindiv, replace=F);
+
+		for (target in GCtargets)
+			geneConversion(target, tractlen);
+
+		sim.setValue("GC", sim.getValue("GC")+nindiv); // logging purpose
+	}
+}
+
+early()
+{
+	if (sim.cycle % 1000 == 0)
+	{
+		cat(">> (" + sim.cycle + ") GC : ");
+		catn(sim.getValue("GC"));
+	}
+	sim.setValue("GC", 0);
+}
+
+2: late() {
+	if (sim.cycle % logtime == 0)
+	{		
+		// output file path
+		fout  = paste( c( runID,"N",Ne,"T",N_generations,"U",Mu,"R",Rho,"s",dsel,"l",sellen,"t",sim.cycle,"sitefreq.csv"), sep="_");
+		saveSiteFreq(fout,sampleSize);		
+	}
+}
+
+// At the end of the simulation, sample genomes and save output
+s1 10000 late()
+{
+	sim.simulationFinished();
+}
